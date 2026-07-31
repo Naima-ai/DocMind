@@ -233,14 +233,6 @@ SYSTEM_PROMPT = (
 )
 
 
-def block_to_dict(block):
-    if block.type == "text":
-        return {"type": "text", "text": block.text}
-    if block.type == "tool_use":
-        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
-    return None
-
-
 def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str:
     st.session_state.messages.append({"role": "user", "content": user_message})
     messages = st.session_state.messages
@@ -255,7 +247,11 @@ def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str
         )
 
         if response.stop_reason == "tool_use":
-            assistant_content = [block_to_dict(b) for b in response.content]
+            # Use the SDK's own serialization so every block type (text,
+            # tool_use, thinking, etc.) round-trips correctly — a hand-rolled
+            # serializer that only knows about "text"/"tool_use" will silently
+            # drop other block types and break the next API call.
+            assistant_content = [b.model_dump() for b in response.content]
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
