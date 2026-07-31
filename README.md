@@ -1,4 +1,4 @@
-# DocMind — Agentic Document Intelligence Platform
+# DocMind: Agentic Document Intelligence Platform
 
 A Streamlit application that combines Retrieval-Augmented Generation (RAG)
 with predictive analytics inside a single **tool-using agent**, rather than
@@ -27,16 +27,7 @@ together before answering.
    Python function → result is returned to Claude → Claude either calls
    another tool or gives a final answer.
 
-## Architecture
 
-```
-Streamlit UI
- ├─ Ingest tab      -> chunk + embed docs (FAISS) / load CSV·XLSX into pandas
- ├─ Chat tab        -> agent loop (Anthropic tool-use) calling:
- │                       - search_documents   (RAG retrieval)
- │                       - forecast_column    (sklearn LinearRegression)
- │                       - assess_risk        (keyword scoring)
- └─ Dashboard tab    -> manual forecast controls + Plotly chart, risk button
 ```
 
 ## Setup
@@ -60,15 +51,3 @@ datasets — only for the chat agent and its tool calls.
 - Persist `st.session_state.chunks` / dataframes to disk or a database so
   ingested knowledge survives a server restart.
 
-## Suggested resume bullets
-
-- Built an agentic document-intelligence platform (Streamlit + Anthropic
-  tool-use API) that autonomously routes between semantic search (RAG),
-  regression-based forecasting, and rule-based risk scoring depending on
-  user intent.
-- Implemented a local RAG pipeline using `sentence-transformers` embeddings
-  and a FAISS vector index to ground LLM answers in ingested company
-  documents (PDF/DOCX/TXT) and eliminate hallucinated citations.
-- Added a predictive-analytics tool (scikit-learn linear regression) that
-  the agent invokes on demand to forecast trends in structured data
-  extracted from company reports, visualized with Plotly.
