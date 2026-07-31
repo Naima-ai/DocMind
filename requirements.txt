@@ -1,0 +1,11 @@
+streamlit>=1.36
+anthropic>=0.34
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+pypdf>=4.2
+python-docx>=1.1
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+plotly>=5.22
+openpyxl>=3.1
