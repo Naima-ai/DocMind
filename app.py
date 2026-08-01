@@ -81,14 +81,26 @@ for key, default in DEFAULT_STATE.items():
         st.session_state[key] = default
 
 
+LOCAL_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "all-MiniLM-L6-v2")
+
+
 @st.cache_resource(show_spinner="Loading embedding model...")
 def load_embedder():
-    """Loads the sentence-embedding model. Tries strict offline mode first
-    (uses the local HuggingFace cache only, no network call at all). If
-    nothing is cached yet, falls back to a normal load, which will download
-    the model this one time and cache it for every future run."""
+    """Loads the sentence-embedding model.
+
+    Preferred path: a plain local folder at ./models/all-MiniLM-L6-v2,
+    produced once by running download_model.py. Loading from a filesystem
+    path makes ZERO network calls — no HuggingFace Hub API hit, so no
+    rate limit (429) or outage can ever affect it.
+
+    Fallback: if that folder doesn't exist, try the HuggingFace cache in
+    strict offline mode, then finally a live online download (which is
+    what can trigger a 429 if HF is throttling this IP)."""
     from sentence_transformers import SentenceTransformer
     model_name = "all-MiniLM-L6-v2"
+
+    if os.path.isdir(LOCAL_MODEL_DIR) and os.listdir(LOCAL_MODEL_DIR):
+        return SentenceTransformer(LOCAL_MODEL_DIR)
 
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -103,11 +115,12 @@ def load_embedder():
         return SentenceTransformer(model_name)
     except Exception as e:
         raise RuntimeError(
-            "Couldn't load the embedding model 'all-MiniLM-L6-v2'. No local "
-            "cache was found, and the online download also failed "
-            f"({e}). Connect this machine to the internet once so it can "
-            "download and cache the model — after that it will run fully "
-            "offline on every future run."
+            "Couldn't load the embedding model. No local model folder was "
+            f"found at '{LOCAL_MODEL_DIR}', no HuggingFace cache was found, "
+            f"and the online download also failed ({e}). Run "
+            "`python download_model.py` once (it retries automatically on "
+            "HuggingFace rate limits) — after that this app never touches "
+            "the network for embeddings again."
         )
 
 
