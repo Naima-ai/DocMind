@@ -459,7 +459,7 @@ def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str
 # Sidebar
 # --------------------------------------------------------------------------
 with st.sidebar:
-    st.title("🧠 DocMind")
+    st.title("DocMind")
     st.caption("Agentic document QA + predictive analytics (fully offline search)")
     api_key = st.text_input("Anthropic API key", type="password")
     model = st.selectbox("Model", MODEL_OPTIONS, index=0)
@@ -488,7 +488,7 @@ with tab_ingest:
         "PDF, DOCX, or TXT", type=["pdf", "docx", "txt"], accept_multiple_files=True
     )
     if doc_files and st.button("Ingest documents"):
-        with st.spinner("Chunking and indexing (offline, no downloads)..."):
+        with st.spinner("Chunking and indexing..."):
             total = 0
             for f in doc_files:
                 total += add_document_to_index(f)
