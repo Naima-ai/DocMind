@@ -11,7 +11,10 @@ A multi-purpose AI agent that:
      mode, so a HuggingFace outage or missing internet connection can't
      break the app once it's been run at least once with connectivity.
   2. Ingests structured data (CSV / XLSX) and can forecast numeric trends
-     (e.g. revenue, complaints, defect counts) using regression.
+     (e.g. revenue, complaints, defect counts) using regression. Works on
+     any uploaded dataset regardless of column formatting (currency
+     symbols, commas, percent signs) — cleaning happens automatically, so
+     a column full of "$1,200" strings is still forecastable.
   3. Answers qualitative / predictive questions that don't have a single
      factual answer (e.g. "What's the expected outcome of the meeting?",
      "What could be the result of Project X?", "Who seems most committed
@@ -25,25 +28,16 @@ A multi-purpose AI agent that:
 
 Run with:  streamlit run app.py
 
-Dependencies (requirements.txt):
-    streamlit
-    pandas
-    numpy
-    plotly
-    scikit-learn
-    sentence-transformers
-    faiss-cpu
-    pypdf
-    python-docx
-    openpyxl
-    anthropic
+Dependencies: see requirements.txt
 
 Offline behavior:
     The embedding model (all-MiniLM-L6-v2, ~90MB) is cached under
     ~/.cache/huggingface the first time it's loaded. Every subsequent load
     is attempted in strict offline mode (HF_HUB_OFFLINE=1) straight from
     that cache — no network call, no dependency on HuggingFace being up.
-    Only the very first run on a machine needs internet.
+    Only the very first run on a machine needs internet (or run
+    download_model.py once to seed a local ./models folder instead, which
+    makes zero network calls ever, at any point).
 """
 
 import os
@@ -197,6 +191,60 @@ def add_document_to_index(uploaded_file) -> int:
     return len(new_chunks)
 
 
+def load_dataframe(uploaded_file):
+    """Reads a CSV/Excel upload into a DataFrame. Never raises — returns
+    None on failure (with a warning shown) so one bad file can't crash the
+    whole ingest step. Handles common encoding issues automatically."""
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith(".csv"):
+            try:
+                return pd.read_csv(uploaded_file)
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                return pd.read_csv(uploaded_file, encoding="latin-1")
+        return pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.warning(f"Could not load '{uploaded_file.name}': {e}")
+        return None
+
+
+def safe_show_dataframe(df: pd.DataFrame):
+    """st.dataframe can raise Arrow serialization errors on mixed-type
+    object columns (a common Streamlit gotcha) — fall back to an
+    all-string view instead of crashing the page."""
+    try:
+        st.dataframe(df.head(20))
+    except Exception:
+        st.dataframe(df.head(20).astype(str))
+
+
+def clean_numeric_series(raw: pd.Series) -> pd.Series:
+    """Robustly coerce ANY column to numeric, regardless of how it's
+    formatted — handles plain numbers, currency ('$1,200'), percentages
+    ('15%'), thousands separators, and stray whitespace. This is what
+    lets the forecaster work on arbitrary uploaded datasets instead of
+    only ones that are already clean float64/int64 columns."""
+    if pd.api.types.is_numeric_dtype(raw):
+        return pd.to_numeric(raw, errors="coerce")
+    cleaned = raw.astype(str).str.replace(r"[,$%]", "", regex=True).str.strip()
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def numeric_value_count(df: pd.DataFrame, column: str) -> int:
+    """How many rows in `column` can be coerced to a usable number, after
+    cleaning. Used to show forecastability in the UI without permanently
+    filtering columns out of the dropdown based on raw dtype alone —
+    that's the bug that made a '$1,200'-formatted revenue column
+    disappear entirely from the selector."""
+    if column not in df.columns:
+        return 0
+    col = df[column]
+    if isinstance(col, pd.DataFrame):
+        col = col.iloc[:, 0]
+    return int(clean_numeric_series(col).notna().sum())
+
+
 # --------------------------------------------------------------------------
 # Agent tools — plain Python functions the model can invoke
 # --------------------------------------------------------------------------
@@ -259,9 +307,18 @@ def forecast_column(dataset_name: str, column_name: str, periods_ahead: int = 3)
             # duplicate column names in the source file — take the first
             col = col.iloc[:, 0]
 
-        series = pd.to_numeric(col, errors="coerce").dropna()
+        try:
+            periods_ahead = int(periods_ahead)
+        except (TypeError, ValueError):
+            periods_ahead = 3
+        periods_ahead = max(1, min(periods_ahead, 24))
+
+        series = clean_numeric_series(col).dropna()
         if len(series) < 3:
-            return "Not enough numeric data points in that column to forecast (need at least 3)."
+            return (
+                f"Column '{column_name}' has only {len(series)} usable numeric value(s) "
+                "after cleaning (stripping $, commas, % signs) — need at least 3 to forecast."
+            )
 
         X = np.arange(len(series)).reshape(-1, 1)
         y = series.to_numpy(dtype=float)
@@ -355,9 +412,11 @@ TOOLS = [
         "name": "forecast_column",
         "description": (
             "Forecast future NUMERIC values of a column from an uploaded structured "
-            "dataset (CSV/Excel) using linear trend regression. Use this whenever the "
-            "user asks about future numeric values, projections, or trends in "
-            "quantitative data (revenue, counts, scores, etc.)."
+            "dataset (CSV/Excel) using linear trend regression. Works on any column "
+            "regardless of formatting (currency symbols, commas, percent signs are "
+            "cleaned automatically). Use this whenever the user asks about future "
+            "numeric values, projections, or trends in quantitative data (revenue, "
+            "counts, scores, etc.)."
         ),
         "input_schema": {
             "type": "object",
@@ -412,11 +471,13 @@ SYSTEM_PROMPT = (
 )
 
 
-def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str:
-    st.session_state.messages.append({"role": "user", "content": user_message})
-    messages = st.session_state.messages
-
-    for _ in range(6):  # cap tool-use loop iterations for safety
+def agent_loop(client: anthropic.Anthropic, model: str, messages: list, max_steps: int = 6):
+    """Runs the tool-use loop: send messages -> Claude may request tool(s) ->
+    execute them locally -> feed results back -> repeat until a final text
+    answer, or the step cap is hit. Returns (final_text, updated_messages).
+    Shared by both the persistent chat (run_agent) and one-off dashboard
+    predictions (run_oneoff), so the two don't duplicate this logic."""
+    for _ in range(max_steps):
         try:
             response = client.messages.create(
                 model=model,
@@ -426,7 +487,7 @@ def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str
                 messages=messages,
             )
         except Exception as e:
-            return f"API call failed: {e}"
+            return f"API call failed: {e}", messages
 
         if response.stop_reason == "tool_use":
             # Use the SDK's own serialization so every block type (text,
@@ -450,9 +511,26 @@ def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str
 
         final_text = "".join(b.text for b in response.content if b.type == "text")
         messages.append({"role": "assistant", "content": final_text})
-        return final_text
+        return final_text, messages
 
-    return "I hit the tool-use step limit without reaching a final answer — try rephrasing."
+    return "I hit the tool-use step limit without reaching a final answer — try rephrasing.", messages
+
+
+def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str:
+    """Persistent chat call — appends to and updates the shared chat history
+    shown in the Chat Agent tab."""
+    st.session_state.messages.append({"role": "user", "content": user_message})
+    answer, updated_messages = agent_loop(client, model, st.session_state.messages)
+    st.session_state.messages = updated_messages
+    return answer
+
+
+def run_oneoff(client: anthropic.Anthropic, model: str, user_message: str) -> str:
+    """One-off call with a fresh message list — used by the Predictions
+    Dashboard so a manual prediction question doesn't clutter the Chat
+    Agent tab's conversation history."""
+    answer, _ = agent_loop(client, model, [{"role": "user", "content": user_message}])
+    return answer
 
 
 # --------------------------------------------------------------------------
@@ -460,7 +538,7 @@ def run_agent(client: anthropic.Anthropic, model: str, user_message: str) -> str
 # --------------------------------------------------------------------------
 with st.sidebar:
     st.title("DocMind")
-    st.caption("Agentic document QA + predictive analytics (fully offline search)")
+    st.caption("Agentic document QA + predictive analytics")
     api_key = st.text_input("Anthropic API key", type="password")
     model = st.selectbox("Model", MODEL_OPTIONS, index=0)
     st.divider()
@@ -471,7 +549,7 @@ with st.sidebar:
         st.error(st.session_state.embedder_error)
     if st.button("Reset session"):
         for key, default in DEFAULT_STATE.items():
-            st.session_state[key] = default
+            st.session_state[key] = default if not isinstance(default, (list, dict)) else type(default)()
         st.rerun()
 
 # --------------------------------------------------------------------------
@@ -506,19 +584,10 @@ with tab_ingest:
     if data_files and st.button("Load datasets"):
         loaded = 0
         for f in data_files:
-            try:
-                if f.name.lower().endswith(".csv"):
-                    try:
-                        df = pd.read_csv(f)
-                    except UnicodeDecodeError:
-                        f.seek(0)
-                        df = pd.read_csv(f, encoding="latin-1")
-                else:
-                    df = pd.read_excel(f)
+            df = load_dataframe(f)
+            if df is not None:
                 st.session_state.dataframes[f.name] = df
                 loaded += 1
-            except Exception as e:
-                st.warning(f"Could not load '{f.name}': {e}")
         if loaded:
             st.success(f"Loaded {loaded} dataset(s).")
 
@@ -526,7 +595,7 @@ with tab_ingest:
         st.subheader("Loaded datasets preview")
         for name, df in st.session_state.dataframes.items():
             with st.expander(name):
-                st.dataframe(df.head(20))
+                safe_show_dataframe(df)
 
 # ---- Chat tab ----
 with tab_chat:
@@ -571,19 +640,30 @@ with tab_predict:
         col1, col2, col3 = st.columns(3)
         with col1:
             ds_name = st.selectbox("Dataset", list(st.session_state.dataframes.keys()))
-        numeric_cols = (
-            st.session_state.dataframes[ds_name]
-            .select_dtypes(include="number")
-            .columns.tolist()
-        )
+
+        active_df = st.session_state.dataframes[ds_name]
+        all_cols = list(active_df.columns)
+
+        # Show every column, not just ones pandas already parsed as numeric —
+        # a column full of "$1,200" or "15%" strings is still forecastable
+        # once cleaned, so filtering by raw dtype hides valid columns. Each
+        # option is annotated with how many usable numeric values it has
+        # after cleaning, so the dropdown surfaces that info instead of
+        # silently disappearing columns (the bug reported earlier).
+        col_labels = {}
+        for c in all_cols:
+            n_valid = numeric_value_count(active_df, c)
+            col_labels[c] = f"{c}  ({n_valid}/{len(active_df)} numeric values)"
+
         with col2:
-            col_name = st.selectbox("Column", numeric_cols) if numeric_cols else None
+            col_name = (
+                st.selectbox("Column", all_cols, format_func=lambda c: col_labels[c])
+                if all_cols else None
+            )
         with col3:
             periods = st.number_input("Periods ahead", min_value=1, max_value=24, value=3)
 
-        if not numeric_cols:
-            st.info("No numeric columns detected in this dataset.")
-        elif col_name and st.button("Run forecast"):
+        if col_name and st.button("Run forecast"):
             result_text = forecast_column(ds_name, col_name, int(periods))
             st.write(result_text)
 
@@ -615,10 +695,29 @@ with tab_predict:
     st.divider()
     st.subheader("Qualitative / predictive question")
     st.caption(
-        "For questions without a single numeric answer, e.g. 'What's the expected "
-        "outcome of Project X?' — use the Chat Agent tab, which calls "
-        "predict_qualitative and reasons over the retrieved evidence."
+        "Ask open-ended predictive questions the documents don't state outright — "
+        "e.g. 'What is the expected outcome of the meeting?', 'What could be the "
+        "result of Project X?', 'Who seems most committed to the work?'. The agent "
+        "retrieves supporting evidence and reasons over it, with a confidence level."
     )
+    judgment_q = st.text_input("Your prediction question")
+    if st.button("Get prediction") and judgment_q:
+        if not api_key:
+            st.error("Add your Anthropic API key in the sidebar first.")
+        else:
+            with st.spinner("Reasoning over the evidence..."):
+                try:
+                    client = anthropic.Anthropic(api_key=api_key)
+                    wrapped_prompt = (
+                        f"Judgment-based prediction request: {judgment_q}\n\n"
+                        "Use the predict_qualitative tool to gather supporting "
+                        "evidence, then give your predicted outcome, a confidence "
+                        "level (Low/Medium/High), and the reasoning behind it."
+                    )
+                    answer = run_oneoff(client, model, wrapped_prompt)
+                    st.markdown(answer)
+                except Exception as e:
+                    st.error(f"Error calling the agent: {e}")
 
     st.divider()
     st.subheader("Document risk assessment")
